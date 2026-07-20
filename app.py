@@ -1,25 +1,95 @@
 from flask import Flask, render_template, request, send_file, redirect, session
 import pickle
 import mysql.connector
+import sqlite3
+import os
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
 
 app = Flask(__name__)
-app.secret_key = "spam_secret_key"
+app.secret_key = os.environ.get("SECRET_KEY", "spam_secret_key")
 
 # Load ML Model
 model = pickle.load(open("model/spam_model.pkl", "rb"))
 cv = pickle.load(open("model/vectorizer.pkl", "rb"))
 
-# MySQL Connection
-conn = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="root123",
-    database="spam_detection"
-)
+# Database Configuration (MySQL with SQLite fallback)
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_USER = os.environ.get("DB_USER", "root")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "root123")
+DB_NAME = os.environ.get("DB_NAME", "spam_detection")
+DB_PORT = os.environ.get("DB_PORT", "3306")
 
-cursor = conn.cursor()
+DB_TYPE = "mysql"
+
+def init_db(connection, cursor_obj, db_type):
+    if db_type == "sqlite":
+        cursor_obj.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL
+            )
+        """)
+        cursor_obj.execute("""
+            CREATE TABLE IF NOT EXISTS email_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_text TEXT NOT NULL,
+                result TEXT NOT NULL,
+                spam_percentage REAL NOT NULL,
+                ham_percentage REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    else:
+        cursor_obj.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(255) NOT NULL,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password VARCHAR(255) NOT NULL
+            )
+        """)
+        cursor_obj.execute("""
+            CREATE TABLE IF NOT EXISTS email_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email_text TEXT NOT NULL,
+                result VARCHAR(255) NOT NULL,
+                spam_percentage FLOAT NOT NULL,
+                ham_percentage FLOAT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    connection.commit()
+
+try:
+    # Attempt MySQL connection
+    conn = mysql.connector.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        port=int(DB_PORT),
+        connection_timeout=5
+    )
+    cursor = conn.cursor()
+    init_db(conn, cursor, "mysql")
+    print("Connected to MySQL database and initialized tables.")
+except Exception as e:
+    print(f"MySQL connection failed: {e}. Falling back to SQLite.")
+    DB_TYPE = "sqlite"
+    conn = sqlite3.connect("spam_detection.db", check_same_thread=False)
+    cursor = conn.cursor()
+    init_db(conn, cursor, "sqlite")
+
+def db_execute(query, params=None):
+    if DB_TYPE == "sqlite":
+        query = query.replace("%s", "?")
+    if params:
+        cursor.execute(query, params)
+    else:
+        cursor.execute(query)
 
 total_predictions = 0
 history = []
@@ -34,7 +104,7 @@ def register():
         email = request.form["email"]
         password = request.form["password"]
 
-        cursor.execute(
+        db_execute(
             """
             INSERT INTO users (username, email, password)
             VALUES (%s, %s, %s)
@@ -54,7 +124,7 @@ def login():
         email = request.form["email"]
         password = request.form["password"]
 
-        cursor.execute(
+        db_execute(
             """
             SELECT * FROM users
             WHERE email=%s AND password=%s
@@ -140,7 +210,7 @@ def predict():
         "result": result
     })
 
-    cursor.execute(
+    db_execute(
         """
         INSERT INTO email_history
         (email_text, result, spam_percentage, ham_percentage)
@@ -181,7 +251,7 @@ def predict():
 
 @app.route("/history")
 def database_history():
-    cursor.execute(
+    db_execute(
         """
         SELECT id,
                email_text,
@@ -258,4 +328,5 @@ def download_pdf():
     )
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "False").lower() in ("true", "1"))
